@@ -25,6 +25,18 @@ GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
 SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "service-account.json")
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Rome")
 
+import json
+import tempfile
+
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+
+if GOOGLE_SERVICE_ACCOUNT_JSON and (SERVICE_ACCOUNT_FILE == "service-account.json"):
+    # Scrive le credenziali in un file temporaneo e usa quello
+    tmp_path = os.path.join(tempfile.gettempdir(), "service-account.json")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(GOOGLE_SERVICE_ACCOUNT_JSON)
+    SERVICE_ACCOUNT_FILE = tmp_path
+
 
 # -----------------------
 #  GOOGLE CALENDAR CLIENT
