@@ -1,177 +1,172 @@
 import os
-import re
+import hmac
+import hashlib
 import json
-import datetime
-import tempfile
-import requests
-from fastapi import FastAPI, Request, Response
+from typing import Any, Dict, Optional
 
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
+import requests
+from fastapi import FastAPI, Request, Header
+from fastapi.responses import PlainTextResponse, JSONResponse
 
 app = FastAPI()
 
+# =========================
+# ENV
+# =========================
+VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")  # must match Meta "Verifica il token"
+APP_SECRET = os.getenv("META_APP_SECRET", "")         # optional (for signature validation)
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")  # numeric id or @channelusername
+
+# Optional: add a prefix so you can recognize messages forwarded by the webhook
+TG_PREFIX = os.getenv("TG_PREFIX", "📩 WA →")
+
+
+# =========================
+# Helpers
+# =========================
+def _safe_json(obj: Any) -> str:
+    try:
+        return json.dumps(obj, ensure_ascii=False, indent=2)
+    except Exception:
+        return str(obj)
+
+
+def _verify_signature(app_secret: str, body: bytes, x_hub_signature_256: Optional[str]) -> bool:
+    """
+    If APP_SECRET is set, verify X-Hub-Signature-256: "sha256=<hex>"
+    If APP_SECRET is empty, we skip verification (return True).
+    """
+    if not app_secret:
+        return True
+    if not x_hub_signature_256 or not x_hub_signature_256.startswith("sha256="):
+        return False
+
+    received = x_hub_signature_256.split("=", 1)[1].strip()
+    expected = hmac.new(app_secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(received, expected)
+
+
+def _telegram_send(text: str) -> None:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        # If you haven't configured Telegram env vars yet, just do nothing.
+        # Railway logs will still show payload.
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+    # avoid exceptions killing the webhook
+    try:
+        requests.post(url, json=payload, timeout=10).raise_for_status()
+    except Exception:
+        pass
+
+
+def _extract_whatsapp_text(payload: Dict[str, Any]) -> str:
+    """
+    Extract a human-friendly text from WhatsApp webhook payload (Cloud API).
+    If we can't detect a message body, return the whole payload as JSON.
+    """
+    try:
+        entries = payload.get("entry", [])
+        for entry in entries:
+            changes = entry.get("changes", [])
+            for change in changes:
+                value = change.get("value", {})
+                messages = value.get("messages", [])
+                contacts = value.get("contacts", [])
+
+                contact_name = ""
+                wa_id = ""
+                if contacts:
+                    contact = contacts[0]
+                    wa_id = contact.get("wa_id", "") or ""
+                    profile = contact.get("profile", {}) or {}
+                    contact_name = profile.get("name", "") or ""
+
+                for msg in messages:
+                    mtype = msg.get("type", "")
+                    from_ = msg.get("from", "") or wa_id
+
+                    body = ""
+                    if mtype == "text":
+                        body = (msg.get("text", {}) or {}).get("body", "") or ""
+                    elif mtype == "button":
+                        body = (msg.get("button", {}) or {}).get("text", "") or ""
+                    elif mtype == "interactive":
+                        inter = msg.get("interactive", {}) or {}
+                        itype = inter.get("type", "")
+                        if itype == "button_reply":
+                            body = ((inter.get("button_reply", {}) or {}).get("title", "")) or ""
+                        elif itype == "list_reply":
+                            body = ((inter.get("list_reply", {}) or {}).get("title", "")) or ""
+                        else:
+                            body = _safe_json(inter)
+                    else:
+                        # media/location/etc.
+                        body = f"[{mtype}] " + _safe_json(msg.get(mtype, msg))
+
+                    who = contact_name or from_ or "unknown"
+                    if body.strip():
+                        return f"{TG_PREFIX} {who}\n\n{body.strip()}"
+
+        # nothing parsed
+        return f"{TG_PREFIX} (unparsed)\n\n{_safe_json(payload)}"
+    except Exception:
+        return f"{TG_PREFIX} (parse-error)\n\n{_safe_json(payload)}"
+
+
+# =========================
+# Routes
+# =========================
 @app.get("/")
-def health():
+async def root():
     return {"ok": True}
 
 
-PREFIX = "🤖"
-
-# ====== ENV ======
-VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
-WA_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
-PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
-
-GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "")
-TIMEZONE = os.getenv("TIMEZONE", "Europe/Rome")
-SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "service-account.json")
-GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")  # consigliato su Railway
-
-# ====== helper: credenziali Google ======
-def get_calendar_service():
-    sa_path = SERVICE_ACCOUNT_FILE
-    if GOOGLE_SERVICE_ACCOUNT_JSON and sa_path == "service-account.json":
-        tmp_path = os.path.join(tempfile.gettempdir(), "service-account.json")
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            f.write(GOOGLE_SERVICE_ACCOUNT_JSON)
-        sa_path = tmp_path
-
-    creds = service_account.Credentials.from_service_account_file(
-        sa_path,
-        scopes=["https://www.googleapis.com/auth/calendar"],
-    )
-    return build("calendar", "v3", credentials=creds)
-
-def create_calendar_event(service, title, start_dt, end_dt, description, location=""):
-    event = {
-        "summary": title,
-        "location": location or "",
-        "description": description or "",
-        "start": {"dateTime": start_dt.isoformat(), "timeZone": TIMEZONE},
-        "end": {"dateTime": end_dt.isoformat(), "timeZone": TIMEZONE},
-    }
-    created = service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
-    return created.get("htmlLink", "")
-
-# ====== parser data/ora dal testo (uguale logica del tuo bot) ======
-def _extract_datetime(text: str):
-    m_date = re.search(r"\b(\d{1,2})[\/.](\d{1,2})[\/.](\d{2,4})\b", text)
-    if not m_date:
-        return None
-    d, m, y = int(m_date.group(1)), int(m_date.group(2)), int(m_date.group(3))
-    if y < 100:
-        y += 2000
-
-    m_time_h = re.search(r"\b[hH]\s*([01]?\d|2[0-3])(?:[.:]([0-5]\d))?\b", text)
-    if m_time_h:
-        hh = int(m_time_h.group(1))
-        mm = int(m_time_h.group(2) or 0)
-        return datetime.datetime(y, m, d, hh, mm)
-
-    m_time_ore = re.search(r"\bore\s*([01]?\d|2[0-3])(?:[.:]([0-5]\d))?\b", text, re.IGNORECASE)
-    if m_time_ore:
-        hh = int(m_time_ore.group(1))
-        mm = int(m_time_ore.group(2) or 0)
-        return datetime.datetime(y, m, d, hh, mm)
-
-    m_time2 = re.search(r"\b([01]?\d|2[0-3])[.:]([0-5]\d)\b", text)
-    if m_time2:
-        hh = int(m_time2.group(1))
-        mm = int(m_time2.group(2))
-        return datetime.datetime(y, m, d, hh, mm)
-
-    return None
-
-def parse_event(text: str):
-    t = (text or "").strip()
-    if not t:
-        return None
-    start_dt = _extract_datetime(t)
-    if not start_dt:
-        return None
-    end_dt = start_dt + datetime.timedelta(hours=1)
-
-    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
-    title = lines[0] if lines else "Evento"
-    location = ""
-    if len(lines) >= 2:
-        candidate = lines[1]
-        if re.match(r"^[^\s]+$", candidate) and not re.search(r"\d", candidate):
-            location = candidate
-
-    return {
-        "title": title,
-        "location": location,
-        "description": t,
-        "start_dt": start_dt,
-        "end_dt": end_dt,
-    }
-
-# ====== WhatsApp: invio risposta ======
-def wa_send_text(to_number: str, text: str):
-    if not (WA_TOKEN and PHONE_NUMBER_ID):
-        return
-    url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
-    headers = {"Authorization": f"Bearer {WA_TOKEN}", "Content-Type": "application/json"}
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to_number,
-        "type": "text",
-        "text": {"body": text},
-    }
-    requests.post(url, headers=headers, data=json.dumps(payload), timeout=10)
-
-# ====== 1) verifica webhook (GET) ======
 @app.get("/webhook")
-def verify_webhook(request: Request):
-    """Webhook verification (GET) required by Meta/WhatsApp Cloud API."""
-    mode = request.query_params.get("hub.mode")
-    token = request.query_params.get("hub.verify_token")
-    challenge = request.query_params.get("hub.challenge")
+async def verify_webhook(request: Request):
+    """
+    Meta webhook verification:
+    - hub.mode=subscribe
+    - hub.verify_token must match WHATSAPP_VERIFY_TOKEN
+    - hub.challenge must be echoed as plain text
+    """
+    params = request.query_params
+    mode = params.get("hub.mode")
+    token = params.get("hub.verify_token")
+    challenge = params.get("hub.challenge")
 
-    if mode == "subscribe" and token and token == VERIFY_TOKEN and challenge is not None:
-        return Response(content=str(challenge), media_type="text/plain", status_code=200)
-    return Response(content="Forbidden", media_type="text/plain", status_code=403)
+    if mode == "subscribe" and token == VERIFY_TOKEN and challenge:
+        return PlainTextResponse(challenge)
 
-# ====== 2) ricezione messaggi (POST) ======
+    return PlainTextResponse("Forbidden", status_code=403)
+
+
 @app.post("/webhook")
-async def incoming(request: Request):
-    data = await request.json()
+async def receive_webhook(
+    request: Request,
+    x_hub_signature_256: Optional[str] = Header(default=None),
+):
+    body = await request.body()
 
-    # struttura: entry -> changes -> value -> messages[]
+    # Optional signature check (only if META_APP_SECRET is set)
+    if not _verify_signature(APP_SECRET, body, x_hub_signature_256):
+        return PlainTextResponse("Invalid signature", status_code=403)
+
     try:
-        changes = data["entry"][0]["changes"][0]["value"]
-        messages = changes.get("messages", [])
-        if not messages:
-            return {"ok": True}
+        payload = json.loads(body.decode("utf-8"))
+    except Exception:
+        return PlainTextResponse("Bad Request", status_code=400)
 
-        msg = messages[0]
-        from_number = msg.get("from", "")
-        text = msg.get("text", {}).get("body", "")
+    # Forward to Telegram (best-effort)
+    text = _extract_whatsapp_text(payload)
+    _telegram_send(text)
 
-        parsed = parse_event(text)
-        if not parsed:
-            wa_send_text(from_number, "Non ho trovato una data/ora evento nel messaggio.")
-            return {"ok": True}
-
-        if not GOOGLE_CALENDAR_ID:
-            wa_send_text(from_number, "Errore: GOOGLE_CALENDAR_ID non configurato.")
-            return {"ok": True}
-
-        service = get_calendar_service()
-        link = create_calendar_event(
-            service=service,
-            title=f"{PREFIX} {parsed['title']}",
-            start_dt=parsed["start_dt"],
-            end_dt=parsed["end_dt"],
-            description=parsed["description"],
-            location=parsed.get("location", ""),
-        )
-
-        wa_send_text(from_number, f"Evento creato ✅\n{link}".strip())
-        return {"ok": True}
-
-    except Exception as e:
-        # evita loop: non rispondere sempre in errore
-        return {"ok": True, "error": repr(e)}
+    # Always 200 to acknowledge delivery
+    return JSONResponse({"status": "ok"})
