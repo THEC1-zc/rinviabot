@@ -11,6 +11,11 @@ from googleapiclient.discovery import build
 
 app = FastAPI()
 
+@app.get("/")
+def health():
+    return {"ok": True}
+
+
 PREFIX = "🤖"
 
 # ====== ENV ======
@@ -118,15 +123,19 @@ def wa_send_text(to_number: str, text: str):
     requests.post(url, headers=headers, data=json.dumps(payload), timeout=10)
 
 # ====== 1) verifica webhook (GET) ======
-@app.get("/wa/webhook")
-def verify(hub_mode: str = "", hub_challenge: str = "", hub_verify_token: str = ""):
-    # Meta manda: hub.mode, hub.challenge, hub.verify_token
-    if hub_mode == "subscribe" and hub_verify_token == VERIFY_TOKEN:
-        return Response(content=hub_challenge, media_type="text/plain")
-    return Response(status_code=403)
+@app.get("/webhook")
+def verify_webhook(request: Request):
+    """Webhook verification (GET) required by Meta/WhatsApp Cloud API."""
+    mode = request.query_params.get("hub.mode")
+    token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge")
+
+    if mode == "subscribe" and token and token == VERIFY_TOKEN and challenge is not None:
+        return Response(content=str(challenge), media_type="text/plain", status_code=200)
+    return Response(content="Forbidden", media_type="text/plain", status_code=403)
 
 # ====== 2) ricezione messaggi (POST) ======
-@app.post("/wa/webhook")
+@app.post("/webhook")
 async def incoming(request: Request):
     data = await request.json()
 
