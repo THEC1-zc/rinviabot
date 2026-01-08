@@ -1,0 +1,6 @@
+.DS_Store
+venv/
+service-account.json
+state.json
+_chat*.txt
+.env
